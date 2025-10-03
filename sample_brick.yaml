@@ -1,101 +1,230 @@
-name: IAM Login Service
-description: Authenticates a user and extracts accessToken, refreshToken, and related metadata from the IAM login response.
-
+name: Build TinyGPTNeoX Model
+description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams.
 inputs:
-  - {name: userName, type: string}
-  - {name: password, type: string}
-  - {name: productId, type: string}
-  - {name: requestType, type: string}
-  - {name: domine, type: string}  # Base URL like https://ig.aidtaas.com
-
+  - {name: tokenizer_json, type: String}
+  - {name: num_layers, type: Integer, default: '4'}
 outputs:
-  - {name: accessToken, type: string}
-  - {name: expiresIn, type: string}
-  - {name: refreshToken, type: string}
-  - {name: tenantId, type: string}
-  - {name: platformId, type: string}
-
+  - {name: model_weights, type: String}
+  - {name: model_config, type: String}
+  - {name: model_py, type: String}
 implementation:
   container:
-    image: python:3.8
+    image: pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
     command:
       - sh
       - -c
       - |
-        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests || \
-        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests --user
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet tokenizers || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet tokenizers --user
         exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import requests
-        import json
-        import argparse
-        import os
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--userName", type=str, required=True)
-        parser.add_argument("--password", type=str, required=True)
-        parser.add_argument("--productId", type=str, required=True)
-        parser.add_argument("--requestType", type=str, required=True)
-        parser.add_argument("--domine", type=str, required=True)
-        parser.add_argument("--accessToken", type=str, required=True)
-        parser.add_argument("--expiresIn", type=str, required=True)
-        parser.add_argument("--refreshToken", type=str, required=True)
-        parser.add_argument("--tenantId", type=str, required=True)
-        parser.add_argument("--platformId", type=str, required=True)
-        args = parser.parse_args()
-
-        url = f"{args.domine}/mobius-iam-service/v1.0/login"
-        headers = {
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "userName": args.userName,
-            "password": args.password,
-            "productId": args.productId,
-            "requestType": args.requestType
-        }
-
-        print(f"Sending POST to {url}")
-        response = requests.post(url, headers=headers, json=payload)
-        print("Status Code:", response.status_code)
-
-        result = response.json()
-        if response.status_code != 200:
-            print("Error:", result)
-
-        def write_output(path, value):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(str(value))
-
-        write_output(args.accessToken, result.get("accessToken", ""))
-        write_output(args.expiresIn, result.get("expiresIn", ""))
-        write_output(args.refreshToken, result.get("refreshToken", ""))
-        write_output(args.tenantId, result.get("tenantId", ""))
-        write_output(args.platformId, result.get("platformId", ""))
-
+        import os, json, argparse, importlib.util, torch
+        from tokenizers import Tokenizer
+        
+        # === model source string (saved to model_py) ===
+        MODEL_PY = r"""
+        import math
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        
+        def rotate_half(x):
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+            return torch.stack((-x2, x1), dim=-1).reshape_as(x)
+        
+        def apply_rotary_pos_emb(q, k, sin, cos):
+            q_rot = (q * cos) + (rotate_half(q) * sin)
+            k_rot = (k * cos) + (rotate_half(k) * sin)
+            return q_rot, k_rot
+        
+        def make_rotary_sin_cos(seq_len, rotary_dim, device, dtype=torch.float32):
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device=device, dtype=dtype) / rotary_dim))
+            positions = torch.arange(seq_len, device=device, dtype=dtype)
+            freqs = torch.einsum("i,j->ij", positions, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return emb.sin(), emb.cos()
+        
+        class MaskedMultiHeadAttention(nn.Module):
+            def __init__(self, emb_dim, num_heads, rotary_pct=0.25, dropout=0.0):
+                super().__init__()
+                assert emb_dim % num_heads == 0
+                self.emb_dim = emb_dim
+                self.num_heads = num_heads
+                self.head_dim = emb_dim // num_heads
+                self.rotary_pct = rotary_pct
+                self.rotary_dim = int(self.head_dim * rotary_pct)
+                if self.rotary_dim % 2 != 0:
+                    self.rotary_dim -= 1
+                self.qkv_proj = nn.Linear(emb_dim, emb_dim * 3, bias=False)
+                self.out_proj = nn.Linear(emb_dim, emb_dim, bias=False)
+                self.dropout = nn.Dropout(dropout)
+            
+            def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
+                B, T, E = x.shape
+                qkv = self.qkv_proj(x).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                if self.rotary_dim > 0 and sin is not None and cos is not None:
+                    q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
+                    k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
+                    sin = sin.view(1, 1, T, self.rotary_dim)
+                    cos = cos.view(1, 1, T, self.rotary_dim)
+                    q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin, cos)
+                    q = torch.cat((q_rot, q_pass), dim=-1)
+                    k = torch.cat((k_rot, k_pass), dim=-1)
+                if past_kv is not None:
+                    past_k, past_v = past_kv
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+                present_kv = (k, v)
+                scale = 1.0 / math.sqrt(self.head_dim)
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+                if attn_mask is None:
+                    q_len, k_len = q.size(2), k.size(2)
+                    mask = torch.ones((q_len, k_len), device=x.device, dtype=torch.bool).tril()
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0)
+                attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
+                attn_probs = self.dropout(torch.softmax(attn_scores, dim=-1))
+                out = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, E)
+                return self.out_proj(out), present_kv
+        
+        class FeedForward(nn.Module):
+            def __init__(self, emb_dim, ff_mult=4, dropout=0.0):
+                super().__init__()
+                self.fc1 = nn.Linear(emb_dim, emb_dim * ff_mult)
+                self.act = nn.GELU()
+                self.fc2 = nn.Linear(emb_dim * ff_mult, emb_dim)
+                self.dropout = nn.Dropout(dropout)
+            
+            def forward(self, x):
+                return self.dropout(self.fc2(self.act(self.fc1(x))))
+        
+        class NeoXBlock(nn.Module):
+            def __init__(self, emb_dim, num_heads, rotary_pct=0.25, ff_mult=4, dropout=0.0):
+                super().__init__()
+                self.ln_attn = nn.LayerNorm(emb_dim)
+                self.ln_ff = nn.LayerNorm(emb_dim)
+                self.attn = MaskedMultiHeadAttention(emb_dim, num_heads, rotary_pct, dropout)
+                self.ff = FeedForward(emb_dim, ff_mult, dropout)
+            
+            def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
+                norm_x = self.ln_attn(x)
+                attn_out, present_kv = self.attn(norm_x, sin, cos, attn_mask, past_kv)
+                x = x + attn_out
+                norm_x = self.ln_ff(x)
+                ff_out = self.ff(norm_x)
+                x = x + ff_out
+                return x, present_kv
+        
+        class TinyGPTNeoX(nn.Module):
+            def __init__(self, cfg):
+                super().__init__()
+                vocab_size, emb_dim = cfg["vocab_size"], cfg["emb_dim"]
+                num_layers = cfg.get("num_layers", 4)
+                num_heads = cfg.get("num_heads", 8)
+                rotary_pct = cfg.get("rotary_pct", 0.25)
+                self.emb = nn.Embedding(vocab_size, emb_dim)
+                self.pos_max = cfg.get("max_seq_len", 512)
+                self.blocks = nn.ModuleList([
+                    NeoXBlock(emb_dim, num_heads, rotary_pct,
+                              ff_mult=cfg.get("ff_mult", 4),
+                              dropout=cfg.get("dropout", 0.0))
+                    for _ in range(num_layers)
+                ])
+                self.final_ln = nn.LayerNorm(emb_dim)
+                self.head = nn.Linear(emb_dim, vocab_size, bias=False)
+                self.head.weight = self.emb.weight
+                rotary_dim = self.blocks[0].attn.rotary_dim
+                if rotary_dim > 0:
+                    sin, cos = make_rotary_sin_cos(self.pos_max, rotary_dim, device="cpu", dtype=torch.float32)
+                    self.register_buffer("sin_cache", sin, persistent=False)
+                    self.register_buffer("cos_cache", cos, persistent=False)
+                else:
+                    self.sin_cache = self.cos_cache = None
+            
+            def forward(self, input_ids, past_kvs=None):
+                B, T = input_ids.shape
+                device = input_ids.device
+                x = self.emb(input_ids)
+                past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
+                if self.sin_cache is not None:
+                    sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
+                    cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
+                else:
+                    sin = cos = None
+                new_kvs = []
+                for i, block in enumerate(self.blocks):
+                    past_kv = past_kvs[i] if past_kvs is not None else None
+                    x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
+                    new_kvs.append(present_kv)
+                x = self.final_ln(x)
+                logits = self.head(x)
+                return logits, new_kvs
+        """
+        
+        def write_output(path, value, mode="w"):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, mode, encoding="utf-8") as f:
+                if isinstance(value, (dict, list)):
+                    json.dump(value, f, indent=2)
+                else:
+                    f.write(str(value))
+        
+        def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument("--tokenizer_json", required=True)
+            ap.add_argument("--num_layers", type=int, required=True)
+            ap.add_argument("--model_weights", required=True)
+            ap.add_argument("--model_config", required=True)
+            ap.add_argument("--model_py", required=True)
+            args = ap.parse_args()
+            
+            tok = Tokenizer.from_file(args.tokenizer_json)
+            vocab_size = tok.get_vocab_size()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_dtype = torch.float16 if device == "cuda" else torch.float32
+            
+            CONFIG = {
+                "vocab_size": vocab_size,
+                "emb_dim": 512,
+                "num_heads": 8,
+                "num_layers": args.num_layers,
+                "ff_mult": 4,
+                "dropout": 0.0,
+                "rotary_pct": 0.25,
+                "max_seq_len": 512,
+                "dtype": "float16" if model_dtype == torch.float16 else "float32",
+            }
+            
+            write_output(args.model_config, CONFIG)
+            write_output(args.model_py, MODEL_PY)
+            
+            spec = importlib.util.spec_from_file_location("tinygpt_neox_model", args.model_py)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            model = mod.TinyGPTNeoX(CONFIG)
+            if model_dtype == torch.float16:
+                model.half()
+            model.to(device).eval()
+            
+            os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
+            torch.save(model.state_dict(), args.model_weights)
+            n_params = sum(p.numel() for p in model.parameters())
+            print(f"[INFO] TinyGPTNeoX init complete: layers={CONFIG['num_layers']} params={n_params}")
+        
+        if __name__ == "__main__":
+            main()
     args:
-      - --userName
-      - {inputValue: userName}
-      - --password
-      - {inputValue: password}
-      - --productId
-      - {inputValue: productId}
-      - --requestType
-      - {inputValue: requestType}
-      - --domine
-      - {inputValue: domine}
-      - --accessToken
-      - {outputPath: accessToken}
-      - --expiresIn
-      - {outputPath: expiresIn}
-      - --refreshToken
-      - {outputPath: refreshToken}
-      - --tenantId
-      - {outputPath: tenantId}
-      - --platformId
-      - {outputPath: platformId}
+      - --tokenizer_json
+      - {inputPath: tokenizer_json}
+      - --num_layers
+      - {inputValue: num_layers}
+      - --model_weights
+      - {outputPath: model_weights}
+      - --model_config
+      - {outputPath: model_config}
+      - --model_py
+      - {outputPath: model_py}
